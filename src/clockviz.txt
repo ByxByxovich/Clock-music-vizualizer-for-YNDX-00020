@@ -1,0 +1,299 @@
+/*
+ * clockviz - 4-column level meter on the LED clock of Yandex Station Mini 2.
+ *
+ * Reads raw PCM (S16_LE) from stdin, does a 512-point FFT, folds 8 log-spaced bands
+ * (40 Hz .. 7.6 kHz) into 4 digits and draws every digit as a 3-segment bar (d -> g -> a,
+ * bottom to top) with smooth per-segment brightness. Algorithm after Morvex885/pulsar
+ * (spectrum.rs + clock.rs): dB scale under a decaying running peak, adaptive per-digit
+ * range (tau 3 s), fast attack / 250 ms release.
+ *
+ * No clock_gettime anywhere: time is counted in audio chunks (kernel 4.9 on the speaker
+ * logs every unknown syscall, e.g. clock_gettime64 from new libc).
+ *
+ * usage: arecord ... -t raw | clockviz [-c channels] [-r rate] [-b maxbright] [-R] [-n]
+ *   -c  channels of the input (default 2)
+ *   -r  sample rate, multiple of 16000 (default 16000)
+ *   -b  max brightness 1..255 (default 255)
+ *   -R  reverse digit order (if bass shows up on the right)
+ *   -n  do not bind-mount over native clock (testing)
+ * env LEDDIR (default /sys/class/leds)
+ */
+#include <errno.h>
+#include <glob.h>
+#include <math.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <poll.h>
+#include <sys/file.h>
+#include <sys/mount.h>
+#include <sys/syscall.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+#define N 512
+#define BANDS 8
+#define DIGITS 4
+#define CHUNK_MS 32.0f
+#define RANGE_DB 45.0f
+#define DECAY_DB 0.096f
+#define FLOOR_DB -70.0f
+#define SILENCE_DB -75.0f
+#define RANGE_TAU_MS 3000.0f
+#define MIN_RANGE 0.15f
+#define RELEASE_MS 250.0f
+#define IDLE_CHUNKS 156 /* ~5 s of silence -> give the clock back */
+#define MAXLED 64
+
+static volatile sig_atomic_t stop;
+static void on_sig(int s) { (void)s; stop = 1; }
+
+static int fd_all[MAXLED];
+static char path_all[MAXLED][320];
+static char dummy_all[MAXLED][64];
+static int n_all;
+static int seg_idx[DIGITS][3]; /* [digit][0=d,1=g,2=a] -> index into fd_all */
+static int grabbed, do_mount = 1, maxb = 255;
+
+static void put(int idx, int v)
+{
+    char b[8];
+    int n = snprintf(b, sizeof b, "%d", v);
+    if (pwrite(fd_all[idx], b, n, 0) < 0) { /* ignore */ }
+}
+
+static void grab(void)
+{
+    if (grabbed) return;
+    for (int i = 0; i < n_all; i++) put(i, 0); /* blank time, colon, ... before hiding */
+    if (do_mount)
+        for (int i = 0; i < n_all; i++) {
+            snprintf(dummy_all[i], sizeof dummy_all[i], "/tmp/clockviz.%d", i);
+            int f = open(dummy_all[i], O_CREAT | O_WRONLY | O_TRUNC, 0644);
+            if (f >= 0) close(f);
+            if (mount(dummy_all[i], path_all[i], NULL, MS_BIND, NULL) < 0)
+                perror(path_all[i]);
+        }
+    grabbed = 1;
+}
+
+static void release(void)
+{
+    if (!grabbed) return;
+    for (int i = 0; i < n_all; i++) put(i, 0);
+    if (do_mount)
+        for (int i = 0; i < n_all; i++) {
+            umount(path_all[i]);
+            unlink(dummy_all[i]);
+        }
+    grabbed = 0;
+}
+
+static float to_db(float p) { return 10.0f * log10f(p + 1e-12f); }
+static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+int main(int argc, char **argv)
+{
+    int ch = 2, rate = 16000, rev = 0, opt;
+    while ((opt = getopt(argc, argv, "c:r:b:Rn")) != -1) {
+        switch (opt) {
+        case 'c': ch = atoi(optarg); break;
+        case 'r': rate = atoi(optarg); break;
+        case 'b': maxb = atoi(optarg); break;
+        case 'R': rev = 1; break;
+        case 'n': do_mount = 0; break;
+        default: return 2;
+        }
+    }
+    if (ch < 1 || rate < 16000 || rate % 16000 || maxb < 1 || maxb > 255) {
+        fprintf(stderr, "bad args\n");
+        return 2;
+    }
+    int decim = rate / 16000;
+    size_t frames = (size_t)N * decim, bytes = frames * ch * 2;
+    int16_t *pcm = malloc(bytes);
+    if (!pcm) return 1;
+
+    /* One instance owns the clock; any other stream copy (e.g. a notification sound while music
+     * plays) is just drained so the player never blocks on a full pipe. */
+    int lk = open("/tmp/clockviz.lock", O_CREAT | O_RDWR, 0644);
+    if (lk >= 0 && flock(lk, LOCK_EX | LOCK_NB) < 0) {
+        while (read(0, pcm, bytes) > 0) { }
+        return 0;
+    }
+
+    /* --- LEDs: open every clock* attribute first; bind-mount hides the real file later,
+     *     but our open fds keep pointing at it. --- */
+    const char *root = getenv("LEDDIR");
+    if (!root) root = "/sys/class/leds";
+    char pat[256];
+    snprintf(pat, sizeof pat, "%s/mini2:white:clock*/brightness", root);
+    glob_t g;
+    if (glob(pat, 0, NULL, &g) != 0 || g.gl_pathc == 0) {
+        fprintf(stderr, "no clock LEDs at %s\n", pat);
+        return 1;
+    }
+    for (size_t i = 0; i < g.gl_pathc && n_all < MAXLED; i++) {
+        int f = open(g.gl_pathv[i], O_WRONLY);
+        if (f < 0) { perror(g.gl_pathv[i]); continue; }
+        fd_all[n_all] = f;
+        snprintf(path_all[n_all], sizeof path_all[0], "%s", g.gl_pathv[i]);
+        n_all++;
+    }
+    globfree(&g);
+    for (int d = 0; d < DIGITS; d++) {
+        const char L[3] = {'D', 'G', 'A'};
+        for (int s = 0; s < 3; s++) {
+            char want[32];
+            snprintf(want, sizeof want, "clock%c%d/", L[s], (rev ? DIGITS - d : d + 1));
+            seg_idx[d][s] = -1;
+            for (int i = 0; i < n_all; i++)
+                if (strstr(path_all[i], want)) seg_idx[d][s] = i;
+            if (seg_idx[d][s] < 0) {
+                fprintf(stderr, "segment %s not found\n", want);
+                return 1;
+            }
+        }
+    }
+    signal(SIGINT, on_sig);
+    signal(SIGTERM, on_sig);
+
+    /* --- analysis tables --- */
+    float window[N], tw_re[N / 2], tw_im[N / 2];
+    for (int i = 0; i < N; i++) window[i] = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * i / N);
+    for (int k = 0; k < N / 2; k++) {
+        tw_re[k] = cosf(-2.0f * (float)M_PI * k / N);
+        tw_im[k] = sinf(-2.0f * (float)M_PI * k / N);
+    }
+    int lo[BANDS], hi[BANDS];
+    float bin_hz = 16000.0f / N;
+    for (int b = 0; b < BANDS; b++) {
+        float l = 40.0f * powf(7600.0f / 40.0f, b / 8.0f);
+        float h = 40.0f * powf(7600.0f / 40.0f, (b + 1) / 8.0f);
+        lo[b] = (int)ceilf(l / bin_hz);
+        hi[b] = (int)floorf(h / bin_hz);
+        if (hi[b] < lo[b]) hi[b] = lo[b];
+    }
+
+    float re[N], im[N];
+    float ref_db = FLOOR_DB;
+    float rlo[DIGITS] = {0}, rhi[DIGITS] = {0};
+    float shown[DIGITS] = {0};
+    int have_range = 0, idle = IDLE_CHUNKS;
+    const float k_rng = expf(-CHUNK_MS / RANGE_TAU_MS);
+    const float k_rel = expf(-CHUNK_MS / RELEASE_MS);
+    int last[DIGITS][3];
+    memset(last, -1, sizeof last);
+
+    while (!stop) {
+        size_t got = 0;
+        while (got < bytes) {
+            {
+                /* Player stopped writing (pause): after one chunk time pad the chunk with silence so the bars
+                 * fall and the idle counter runs. Raw poll syscall: glibc's own poll would try
+                 * ppoll_time64 first and trip the kernel's unknown-syscall dump. */
+                struct pollfd pf = { 0, POLLIN, 0 };
+#ifdef SYS_poll
+                long pr = syscall(SYS_poll, &pf, 1, 32);
+#else
+                long pr = poll(&pf, 1, 32);
+#endif
+                if (pr == 0) { memset((char *)pcm + got, 0, bytes - got); got = bytes; break; }
+                if (pr < 0 && errno == EINTR) { if (stop) break; continue; }
+            }
+            ssize_t r = read(0, (char *)pcm + got, bytes - got);
+            if (r <= 0) { stop = 1; break; }
+            got += (size_t)r;
+        }
+        if (stop) break;
+
+        for (int i = 0; i < N; i++) {
+            float s = 0;
+            for (int j = 0; j < decim * ch; j++) s += pcm[(size_t)i * decim * ch + j];
+            re[i] = s / (decim * ch * 32768.0f) * window[i];
+            im[i] = 0;
+        }
+        /* in-place radix-2 FFT */
+        for (int i = 1, j = 0; i < N; i++) {
+            int bit = N >> 1;
+            for (; j & bit; bit >>= 1) j ^= bit;
+            j ^= bit;
+            if (i < j) {
+                float t = re[i]; re[i] = re[j]; re[j] = t;
+                t = im[i]; im[i] = im[j]; im[j] = t;
+            }
+        }
+        for (int len = 2; len <= N; len <<= 1) {
+            int step = N / len;
+            for (int i = 0; i < N; i += len)
+                for (int k = 0; k < len / 2; k++) {
+                    int a = i + k, b = a + len / 2;
+                    float vr = re[b] * tw_re[k * step] - im[b] * tw_im[k * step];
+                    float vi = re[b] * tw_im[k * step] + im[b] * tw_re[k * step];
+                    re[b] = re[a] - vr; im[b] = im[a] - vi;
+                    re[a] += vr; im[a] += vi;
+                }
+        }
+        const float scale = 16.0f / ((float)N * N); /* full-scale sine = 0 dB */
+        float power[BANDS], total = 0, max_db = FLOOR_DB;
+        for (int b = 0; b < BANDS; b++) {
+            float p = 0;
+            for (int k = lo[b]; k <= hi[b]; k++) p += re[k] * re[k] + im[k] * im[k];
+            power[b] = p * scale / (hi[b] - lo[b] + 1);
+            total += power[b];
+            float d = to_db(power[b]);
+            if (d > max_db) max_db = d;
+        }
+
+        float in[DIGITS] = {0};
+        if (to_db(total) < SILENCE_DB) {
+            ref_db = fmaxf(FLOOR_DB, ref_db - DECAY_DB);
+            if (idle < IDLE_CHUNKS) idle++;
+        } else {
+            idle = 0;
+            ref_db = fmaxf(FLOOR_DB, fmaxf(max_db, ref_db - DECAY_DB));
+            float x[DIGITS];
+            for (int d = 0; d < DIGITS; d++) {
+                float v0 = clampf((to_db(power[2 * d]) - (ref_db - RANGE_DB)) / RANGE_DB, 0, 1);
+                float v1 = clampf((to_db(power[2 * d + 1]) - (ref_db - RANGE_DB)) / RANGE_DB, 0, 1);
+                x[d] = (v0 + v1) / 2.0f;
+            }
+            for (int d = 0; d < DIGITS; d++) {
+                if (!have_range) { rlo[d] = rhi[d] = x[d]; }
+                else {
+                    rhi[d] = x[d] > rhi[d] ? x[d] : (rhi[d] - x[d]) * k_rng + x[d];
+                    rlo[d] = x[d] < rlo[d] ? x[d] : (rlo[d] - x[d]) * k_rng + x[d];
+                }
+                float span = fmaxf(rhi[d] - rlo[d], MIN_RANGE);
+                float base = clampf((rhi[d] + rlo[d] - span) / 2.0f, 0.0f, 1.0f - span);
+                in[d] = clampf((x[d] - base) / span, 0, 1);
+            }
+            have_range = 1;
+        }
+
+        if (idle >= IDLE_CHUNKS) { /* nothing playing: native clock back */
+            release();
+            have_range = 0;
+            memset(shown, 0, sizeof shown);
+            memset(last, -1, sizeof last);
+            continue;
+        }
+        grab();
+        for (int d = 0; d < DIGITS; d++) {
+            float dec = shown[d] * k_rel;
+            shown[d] = in[d] < dec ? dec : in[d];
+            float xx = 3.0f * shown[d];
+            for (int s = 0; s < 3; s++) {
+                int v = (int)lroundf(maxb * clampf(xx - s, 0, 1));
+                if (v != last[d][s]) { put(seg_idx[d][s], v); last[d][s] = v; }
+            }
+        }
+        if (getenv("VIZDEBUG"))
+            fprintf(stderr, "%.2f %.2f %.2f %.2f\n", shown[0], shown[1], shown[2], shown[3]);
+    }
+    release();
+    return 0;
+}
