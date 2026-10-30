@@ -1,5 +1,5 @@
 # Clock-music-vizualizer-for-YNDX-00020
-# clockviz
+# 100% by Claude
 
 clockviz — это легкий эквалайзер / визуализатор спектра (4-столбчатый level meter) для LED-дисплея Яндекс Станции Мини 2.
 
