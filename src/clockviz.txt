@@ -7,6 +7,10 @@
  * (spectrum.rs + clock.rs): dB scale under a decaying running peak, adaptive per-digit
  * range (tau 3 s), fast attack / 250 ms release.
  *
+ * Several copies may run at once (one per playing stream). Only the owner of a flock draws;
+ * the others keep analysing and take the clock over as soon as it is free and their stream has
+ * sound. An owner whose stream has been silent ~5 s gives the clock (and the lock) back.
+ *
  * No clock_gettime anywhere: time is counted in audio chunks (kernel 4.9 on the speaker
  * logs every unknown syscall, e.g. clock_gettime64 from new libc).
  *
@@ -56,7 +60,12 @@ static char path_all[MAXLED][320];
 static char dummy_all[MAXLED][64];
 static int n_all;
 static int seg_idx[DIGITS][3]; /* [digit][0=d,1=g,2=a] -> index into fd_all */
+static int saved[MAXLED];
+static int last[DIGITS][3];
 static int grabbed, do_mount = 1, maxb = 255;
+static int led_ready, g_rev;
+static const char *led_root;
+static int trace;
 
 static void put(int idx, int v)
 {
@@ -68,6 +77,12 @@ static void put(int idx, int v)
 static void grab(void)
 {
     if (grabbed) return;
+    for (int i = 0; i < n_all; i++) { /* remember what is really lit right now */
+        char b[16] = {0};
+        ssize_t r = pread(fd_all[i], b, sizeof b - 1, 0);
+        int v = r > 0 ? atoi(b) : 0;
+        saved[i] = v < 0 ? 0 : (v > 255 ? 255 : v);
+    }
     for (int i = 0; i < n_all; i++) put(i, 0); /* blank time, colon, ... before hiding */
     if (do_mount)
         for (int i = 0; i < n_all; i++) {
@@ -83,13 +98,80 @@ static void grab(void)
 static void release(void)
 {
     if (!grabbed) return;
-    for (int i = 0; i < n_all; i++) put(i, 0);
+    for (int i = 0; i < n_all; i++) {
+        int v = 0;
+        if (do_mount) {
+            /* What the stock code wrote to the dummy while we owned the clock is what it
+             * believes is on the display (it may redraw only changed segments), so put that
+             * on the real LED; fall back to the state from before the grab. */
+            char b[16] = {0};
+            int f = open(dummy_all[i], O_RDONLY);
+            ssize_t r = f >= 0 ? read(f, b, sizeof b - 1) : 0;
+            if (f >= 0) close(f);
+            int t = r > 0 ? atoi(b) : -1;
+            v = (r > 0 && t >= 0 && t <= 255) ? t : saved[i];
+        }
+        put(i, v);
+    }
     if (do_mount)
         for (int i = 0; i < n_all; i++) {
-            umount(path_all[i]);
+            if (umount(path_all[i]) < 0)
+                umount2(path_all[i], MNT_DETACH); /* busy: detach lazily, never leave it mounted */
             unlink(dummy_all[i]);
         }
     grabbed = 0;
+}
+
+
+static int led_open(void)
+{
+    char pat[256];
+    snprintf(pat, sizeof pat, "%s/mini2:white:clock*/brightness", led_root);
+    glob_t g;
+    if (glob(pat, 0, NULL, &g) != 0 || g.gl_pathc == 0) {
+        fprintf(stderr, "no clock LEDs at %s\n", pat);
+        return -1;
+    }
+    if (do_mount) /* leftovers of a crashed run (we hold the lock): peel every stale layer */
+        for (size_t i = 0; i < g.gl_pathc; i++)
+            while (umount2(g.gl_pathv[i], MNT_DETACH) == 0) { }
+    for (size_t i = 0; i < g.gl_pathc && n_all < MAXLED; i++) {
+        int f = open(g.gl_pathv[i], O_RDWR);
+        if (f < 0) { perror(g.gl_pathv[i]); continue; }
+        fd_all[n_all] = f;
+        snprintf(path_all[n_all], sizeof path_all[0], "%s", g.gl_pathv[i]);
+        n_all++;
+    }
+    globfree(&g);
+    for (int d = 0; d < DIGITS; d++) {
+        const char L[3] = {'D', 'G', 'A'};
+        for (int s = 0; s < 3; s++) {
+            char want[32];
+            snprintf(want, sizeof want, "clock%c%d/", L[s], (g_rev ? DIGITS - d : d + 1));
+            seg_idx[d][s] = -1;
+            for (int i = 0; i < n_all; i++)
+                if (strstr(path_all[i], want)) seg_idx[d][s] = i;
+            if (seg_idx[d][s] < 0) {
+                fprintf(stderr, "segment %s not found\n", want);
+                return -1;
+            }
+        }
+    }
+    led_ready = 1;
+    return 0;
+}
+
+/* called right after we won the lock */
+static int led_acquire(void)
+{
+    if (!led_ready) {
+        if (led_open() < 0) return -1;
+    } else if (do_mount) {
+        for (int i = 0; i < n_all; i++)
+            while (umount2(path_all[i], MNT_DETACH) == 0) { }
+    }
+    memset(last, -1, sizeof last);
+    return 0;
 }
 
 static float to_db(float p) { return 10.0f * log10f(p + 1e-12f); }
@@ -117,49 +199,17 @@ int main(int argc, char **argv)
     int16_t *pcm = malloc(bytes);
     if (!pcm) return 1;
 
-    /* One instance owns the clock; any other stream copy (e.g. a notification sound while music
-     * plays) is just drained so the player never blocks on a full pipe. */
     int lk = open("/tmp/clockviz.lock", O_CREAT | O_RDWR, 0644);
-    if (lk >= 0 && flock(lk, LOCK_EX | LOCK_NB) < 0) {
-        while (read(0, pcm, bytes) > 0) { }
-        return 0;
-    }
+    int owner = 0, no_led = 0;
+    g_rev = rev;
+    led_root = getenv("LEDDIR");
+    if (!led_root) led_root = "/sys/class/leds";
+    trace = getenv("VIZTRACE") != NULL;
 
-    /* --- LEDs: open every clock* attribute first; bind-mount hides the real file later,
-     *     but our open fds keep pointing at it. --- */
-    const char *root = getenv("LEDDIR");
-    if (!root) root = "/sys/class/leds";
-    char pat[256];
-    snprintf(pat, sizeof pat, "%s/mini2:white:clock*/brightness", root);
-    glob_t g;
-    if (glob(pat, 0, NULL, &g) != 0 || g.gl_pathc == 0) {
-        fprintf(stderr, "no clock LEDs at %s\n", pat);
-        return 1;
-    }
-    for (size_t i = 0; i < g.gl_pathc && n_all < MAXLED; i++) {
-        int f = open(g.gl_pathv[i], O_WRONLY);
-        if (f < 0) { perror(g.gl_pathv[i]); continue; }
-        fd_all[n_all] = f;
-        snprintf(path_all[n_all], sizeof path_all[0], "%s", g.gl_pathv[i]);
-        n_all++;
-    }
-    globfree(&g);
-    for (int d = 0; d < DIGITS; d++) {
-        const char L[3] = {'D', 'G', 'A'};
-        for (int s = 0; s < 3; s++) {
-            char want[32];
-            snprintf(want, sizeof want, "clock%c%d/", L[s], (rev ? DIGITS - d : d + 1));
-            seg_idx[d][s] = -1;
-            for (int i = 0; i < n_all; i++)
-                if (strstr(path_all[i], want)) seg_idx[d][s] = i;
-            if (seg_idx[d][s] < 0) {
-                fprintf(stderr, "segment %s not found\n", want);
-                return 1;
-            }
-        }
-    }
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
+    signal(SIGHUP, on_sig);
+    signal(SIGPIPE, SIG_IGN);
 
     /* --- analysis tables --- */
     float window[N], tw_re[N / 2], tw_im[N / 2];
@@ -185,7 +235,6 @@ int main(int argc, char **argv)
     int have_range = 0, idle = IDLE_CHUNKS;
     const float k_rng = expf(-CHUNK_MS / RANGE_TAU_MS);
     const float k_rel = expf(-CHUNK_MS / RELEASE_MS);
-    int last[DIGITS][3];
     memset(last, -1, sizeof last);
 
     while (!stop) {
@@ -274,12 +323,29 @@ int main(int argc, char **argv)
             have_range = 1;
         }
 
-        if (idle >= IDLE_CHUNKS) { /* nothing playing: native clock back */
-            release();
+        if (idle >= IDLE_CHUNKS) { /* nothing playing: native clock back, lock free */
+            if (owner) {
+                release();
+                if (lk >= 0) flock(lk, LOCK_UN);
+                owner = 0;
+                if (trace) fprintf(stderr, "[%d] idle -> released\n", (int)getpid());
+            }
             have_range = 0;
             memset(shown, 0, sizeof shown);
             memset(last, -1, sizeof last);
             continue;
+        }
+        if (!owner) { /* sound in our stream and the clock is free? take it */
+            if (idle == 0 && !no_led && lk >= 0 && flock(lk, LOCK_EX | LOCK_NB) == 0) {
+                if (led_acquire() == 0) {
+                    owner = 1;
+                    if (trace) fprintf(stderr, "[%d] acquired\n", (int)getpid());
+                } else {
+                    flock(lk, LOCK_UN);
+                    no_led = 1; /* keep draining so the player never blocks */
+                }
+            }
+            if (!owner) continue;
         }
         grab();
         for (int d = 0; d < DIGITS; d++) {
